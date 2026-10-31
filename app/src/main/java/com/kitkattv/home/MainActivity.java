@@ -1,18 +1,24 @@
 package com.kitkattv.home;
 
+import android.animation.ArgbEvaluator;
+import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
 import android.text.format.DateFormat;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -28,6 +34,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
@@ -37,6 +44,8 @@ import java.util.Locale;
 /** A small Home screen for old MStar Android 4.4 TVs: one grid, no network, nothing in the background. */
 public class MainActivity extends Activity {
     private static final int COLUMNS = 5;
+    private static final long IDLE_MS = 3 * 60 * 1000;
+    private static final long CLOCK_MOVE_MS = 60 * 1000;
     private static final String TV_PLAYER = "com.mstar.tv.tvplayer.ui";
     private static final String INPUT_LIST =
             TV_PLAYER + ".intent.action.InputSourceListViewActivity";
@@ -45,21 +54,41 @@ public class MainActivity extends Activity {
             "com.kitkattv.home", "com.assem.launcher", "com.android.launcher",
             "com.ctv.factorytest", "mstar.factorymenu.ui", "tvtests.com.mstar.android.tv",
             "com.android.wididemo", "com.android.mcastdemo", "com.ctv.app", TV_PLAYER,
+            "com.android.providers.downloads.ui", "com.google.android.gms",
+            "com.google.android.gsf.login",
     };
-    /** Shown first, in this order, when installed. */
+    private static final String SMARTTUBE = "org.smarttube.stable";
+    /** Apps too new for Android 4.4: these tiles lead to the HDMI input of a streaming stick. */
+    private static final String[][] STICK_APPS = {
+            {"Netflix", "#B20710"}, {"Spotify", "#14833B"}, {"Shahid", "#007C89"}, {"WATCH IT", "#C77700"},
+    };
+    /** Shown after the inputs, in this order, when installed. */
     private static final String[] PINNED = {
-            "org.smarttube.stable", "com.cultraview.mediacenter", "com.android.vending",
+            "com.cultraview.mediacenter", "com.android.vending",
             "com.android.settings", "com.cultraview.filemanager",
     };
-    private static final int[] COLORS = {
-            0xFF8E2433, 0xFF1F6F8B, 0xFF2E7D4F, 0xFF6A4BA3, 0xFF9A6516, 0xFF35506E,
-    };
+    private static final int[] COLORS = {0xFF5A3E9B, 0xFF1F6F8B, 0xFF2E7D4F, 0xFF35506E, 0xFF8E2433};
+    private static final int YOUTUBE_COLOR = 0xFFC4161C;
+    private static final int INPUTS_COLOR = 0xFF3A4A63;
+    private static final int RING = 0xFFFFFFFF;
 
     private final List<Tile> tiles = new ArrayList<Tile>();
+    private final Handler handler = new Handler();
+    private final BaseAdapter adapter = new TileAdapter();
+    private final GradientDrawable backdrop = new GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM, new int[] {Color.BLACK, Color.BLACK});
+    private TextView greeting;
+    private TextView title;
+    private TextView subtitle;
     private TextView clock;
     private TextView date;
     private GridView grid;
-    private final BaseAdapter adapter = new TileAdapter();
+    private FrameLayout idleLayer;
+    private TextView idleClock;
+    private View focused;
+    private int glow = Color.BLACK;
+    private ValueAnimator glowAnimator;
+    private int selectedPosition;
 
     private final BroadcastReceiver ticker = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -67,50 +96,117 @@ public class MainActivity extends Activity {
         }
     };
 
+    private final Runnable showIdle = new Runnable() {
+        @Override public void run() {
+            idleLayer.setAlpha(0f);
+            idleLayer.setVisibility(View.VISIBLE);
+            idleLayer.animate().alpha(1f).setDuration(800).start();
+            moveIdleClock.run();
+        }
+    };
+
+    /** Keeps the idle clock moving so nothing burns into the panel. */
+    private final Runnable moveIdleClock = new Runnable() {
+        @Override public void run() {
+            float x = (float) Math.random() * Math.max(0, idleLayer.getWidth() - idleClock.getWidth());
+            float y = (float) Math.random() * Math.max(0, idleLayer.getHeight() - idleClock.getHeight());
+            idleClock.setX(x);
+            idleClock.setY(y);
+            handler.postDelayed(this, CLOCK_MOVE_MS);
+        }
+    };
+
     private static final class Tile {
         final String label;
+        final String about;
         final Drawable icon;
         final Intent intent;
+        final int color;
+        final boolean needsStick;
 
-        Tile(String label, Drawable icon, Intent intent) {
+        Tile(String label, String about, Drawable icon, Intent intent, int color, boolean needsStick) {
             this.label = label;
+            this.about = about;
             this.icon = icon;
             this.intent = intent;
+            this.color = color;
+            this.needsStick = needsStick;
         }
     }
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        FrameLayout frame = new FrameLayout(this);
+        frame.setBackground(backdrop);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.BLACK);
-        root.setPadding(px(48), px(28), px(48), px(20));
+        root.setPadding(px(52), px(30), px(52), px(16));
+        root.setClipChildren(false);
+        root.setClipToPadding(false);
 
-        clock = text(46, Color.WHITE);
-        date = text(18, 0xFFAAAAAA);
-        root.addView(clock);
-        root.addView(date);
+        LinearLayout header = new LinearLayout(this);
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+        greeting = text(18, 0xCCFFFFFF);
+        title = text(44, Color.WHITE);
+        title.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
+        subtitle = text(17, 0xBBFFFFFF);
+        left.addView(greeting);
+        left.addView(title);
+        left.addView(subtitle);
+        header.addView(left, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        LinearLayout right = new LinearLayout(this);
+        right.setOrientation(LinearLayout.VERTICAL);
+        right.setGravity(Gravity.END);
+        clock = text(40, Color.WHITE);
+        clock.setTypeface(Typeface.create("sans-serif-thin", Typeface.NORMAL));
+        date = text(16, 0xBBFFFFFF);
+        right.addView(clock);
+        right.addView(date);
+        header.addView(right);
+        root.addView(header);
 
         grid = new GridView(this);
         grid.setNumColumns(COLUMNS);
-        grid.setVerticalSpacing(px(16));
-        grid.setHorizontalSpacing(px(16));
-        grid.setPadding(px(6), px(6), px(6), px(6));
+        grid.setVerticalSpacing(px(22));
+        grid.setHorizontalSpacing(px(22));
+        grid.setPadding(px(14), px(14), px(14), px(14));
         grid.setClipToPadding(false);
+        grid.setClipChildren(false);
         grid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
-        grid.setDrawSelectorOnTop(true);
-        grid.setSelector(ring());
+        grid.setSelector(new GradientDrawable());
+        grid.setVerticalScrollBarEnabled(false);
         grid.setAdapter(adapter);
         grid.setOnItemClickListener(new AdapterView.OnItemClickListener() {
             @Override public void onItemClick(AdapterView<?> p, View v, int position, long id) {
                 open(tiles.get(position));
             }
         });
+        grid.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> p, View v, int position, long id) {
+                select(v, position);
+            }
+
+            @Override public void onNothingSelected(AdapterView<?> p) {
+            }
+        });
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        lp.topMargin = px(24);
+        lp.topMargin = px(14);
         root.addView(grid, lp);
-        setContentView(root);
+        frame.addView(root);
+
+        idleLayer = new FrameLayout(this);
+        idleLayer.setBackgroundColor(Color.BLACK);
+        idleLayer.setVisibility(View.GONE);
+        idleClock = text(96, 0xDDFFFFFF);
+        idleClock.setTypeface(Typeface.create("sans-serif-thin", Typeface.NORMAL));
+        idleLayer.addView(idleClock, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        frame.addView(idleLayer);
+        setContentView(frame);
     }
 
     @Override protected void onResume() {
@@ -119,11 +215,26 @@ public class MainActivity extends Activity {
         showTime();
         registerReceiver(ticker, new IntentFilter(Intent.ACTION_TIME_TICK));
         grid.requestFocus();
+        grid.setSelection(Math.min(selectedPosition, Math.max(0, tiles.size() - 1)));
+        grid.post(new Runnable() {
+            @Override public void run() {
+                select(grid.getSelectedView(), grid.getSelectedItemPosition());
+            }
+        });
+        wake();
     }
 
     @Override protected void onPause() {
         unregisterReceiver(ticker);
+        handler.removeCallbacksAndMessages(null);
         super.onPause();
+    }
+
+    /** Any key wakes the idle clock, and that first key does nothing else. */
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        boolean sleeping = idleLayer.getVisibility() == View.VISIBLE;
+        wake();
+        return sleeping || super.dispatchKeyEvent(event);
     }
 
     /** Home has nowhere to go back to. */
@@ -131,46 +242,78 @@ public class MainActivity extends Activity {
         return keyCode == KeyEvent.KEYCODE_BACK || super.onKeyDown(keyCode, event);
     }
 
+    private void wake() {
+        handler.removeCallbacks(showIdle);
+        handler.removeCallbacks(moveIdleClock);
+        idleLayer.animate().cancel();
+        idleLayer.setVisibility(View.GONE);
+        handler.postDelayed(showIdle, IDLE_MS);
+    }
+
     private void loadTiles() {
         tiles.clear();
         PackageManager pm = getPackageManager();
-        Intent inputs = new Intent(INPUT_LIST);
-        if (pm.resolveActivity(inputs, 0) != null) {
-            tiles.add(new Tile("TV Inputs", null, inputs));
-        }
         Intent main = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
-        List<Tile> rest = new ArrayList<Tile>();
         List<ResolveInfo> apps = pm.queryIntentActivities(main, 0);
+        Intent inputs = new Intent(INPUT_LIST);
+        boolean hasInputs = pm.resolveActivity(inputs, 0) != null;
+
+        ResolveInfo youtube = find(apps, SMARTTUBE);
+        if (youtube != null) {
+            tiles.add(new Tile("YouTube", "Videos, without leaving the couch", youtube.loadIcon(pm),
+                    launch(youtube), YOUTUBE_COLOR, false));
+        }
+        for (String[] app : STICK_APPS) {
+            tiles.add(new Tile(app[0], "Needs a streaming stick on HDMI", null,
+                    hasInputs ? inputs : null, Color.parseColor(app[1]), true));
+        }
+        if (hasInputs) {
+            tiles.add(new Tile("TV Inputs", "HDMI and AV", null, inputs, INPUTS_COLOR, false));
+        }
+        int next = 0;
         for (String pin : PINNED) {
-            for (ResolveInfo app : apps) {
-                if (app.activityInfo.packageName.equals(pin)) {
-                    tiles.add(tile(pm, app));
-                    break;
-                }
+            ResolveInfo app = find(apps, pin);
+            if (app != null) {
+                tiles.add(tile(pm, app, COLORS[next++ % COLORS.length]));
             }
         }
+        List<ResolveInfo> rest = new ArrayList<ResolveInfo>();
         for (ResolveInfo app : apps) {
             String pkg = app.activityInfo.packageName;
-            if (!contains(PINNED, pkg) && !isHidden(pkg)) {
-                rest.add(tile(pm, app));
+            if (!contains(PINNED, pkg) && !pkg.equals(SMARTTUBE) && !isHidden(pkg)) {
+                rest.add(app);
             }
         }
-        Collections.sort(rest, new Comparator<Tile>() {
-            @Override public int compare(Tile a, Tile b) {
-                return a.label.compareToIgnoreCase(b.label);
+        final PackageManager manager = pm;
+        Collections.sort(rest, new Comparator<ResolveInfo>() {
+            @Override public int compare(ResolveInfo a, ResolveInfo b) {
+                return String.valueOf(a.loadLabel(manager))
+                        .compareToIgnoreCase(String.valueOf(b.loadLabel(manager)));
             }
         });
-        tiles.addAll(rest);
+        for (ResolveInfo app : rest) {
+            tiles.add(tile(pm, app, COLORS[next++ % COLORS.length]));
+        }
         adapter.notifyDataSetChanged();
     }
 
-    private Tile tile(PackageManager pm, ResolveInfo app) {
-        Intent launch = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    private static ResolveInfo find(List<ResolveInfo> apps, String pkg) {
+        for (ResolveInfo app : apps) {
+            if (app.activityInfo.packageName.equals(pkg)) {
+                return app;
+            }
+        }
+        return null;
+    }
+
+    private Intent launch(ResolveInfo app) {
+        return new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
                 .setComponent(new ComponentName(app.activityInfo.packageName, app.activityInfo.name))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-        String label = app.activityInfo.packageName.equals("org.smarttube.stable")
-                ? "YouTube" : String.valueOf(app.loadLabel(pm));
-        return new Tile(label, app.loadIcon(pm), launch);
+    }
+
+    private Tile tile(PackageManager pm, ResolveInfo app, int color) {
+        return new Tile(String.valueOf(app.loadLabel(pm)), "", app.loadIcon(pm), launch(app), color, false);
     }
 
     private static boolean isHidden(String pkg) {
@@ -187,7 +330,27 @@ public class MainActivity extends Activity {
         return false;
     }
 
-    private void open(Tile tile) {
+    private void open(final Tile tile) {
+        if (tile.needsStick) {
+            AlertDialog.Builder dialog = new AlertDialog.Builder(this, AlertDialog.THEME_HOLO_DARK)
+                    .setTitle(tile.label)
+                    .setMessage(tile.label + " can't run on this TV's Android 4.4.\n"
+                            + "Plug in a streaming stick, then pick its HDMI input.")
+                    .setNegativeButton("Back", null);
+            if (tile.intent != null) {
+                dialog.setPositiveButton("Open TV Inputs", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int which) {
+                        start(tile);
+                    }
+                });
+            }
+            dialog.show();
+            return;
+        }
+        start(tile);
+    }
+
+    private void start(Tile tile) {
         try {
             startActivity(tile.intent);
         } catch (ActivityNotFoundException | SecurityException e) {
@@ -195,10 +358,50 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void select(View view, int position) {
+        if (position < 0 || position >= tiles.size()) {
+            return;
+        }
+        selectedPosition = position;
+        Tile tile = tiles.get(position);
+        title.setText(tile.label);
+        subtitle.setText(tile.about);
+        fadeGlow(tile.color);
+        if (focused != null && focused != view) {
+            focused.animate().scaleX(1f).scaleY(1f).setDuration(140).start();
+            ((GradientDrawable) focused.getBackground()).setStroke(0, RING);
+        }
+        if (view != null) {
+            view.animate().scaleX(1.06f).scaleY(1.06f).setDuration(140).start();
+            ((GradientDrawable) view.getBackground()).setStroke(px(3), RING);
+        }
+        focused = view;
+    }
+
+    private void fadeGlow(int target) {
+        if (glowAnimator != null) {
+            glowAnimator.cancel();
+        }
+        glowAnimator = ValueAnimator.ofObject(new ArgbEvaluator(), glow, target);
+        glowAnimator.setDuration(260);
+        glowAnimator.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            @Override public void onAnimationUpdate(ValueAnimator animation) {
+                glow = (Integer) animation.getAnimatedValue();
+                backdrop.setColors(new int[] {glow, 0xFF08080C, Color.BLACK});
+            }
+        });
+        glowAnimator.start();
+    }
+
     private void showTime() {
         Date now = new Date();
-        clock.setText(DateFormat.getTimeFormat(this).format(now));
+        String time = DateFormat.getTimeFormat(this).format(now);
+        clock.setText(time);
+        idleClock.setText(time);
         date.setText(DateFormat.format("EEEE, MMMM d", now));
+        int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
+        greeting.setText(hour < 5 ? "Up late" : hour < 12 ? "Good morning"
+                : hour < 18 ? "Good afternoon" : "Good evening");
     }
 
     private TextView text(float sp, int color) {
@@ -207,14 +410,6 @@ public class MainActivity extends Activity {
         view.setTextColor(color);
         view.setSingleLine(true);
         return view;
-    }
-
-    private GradientDrawable ring() {
-        GradientDrawable ring = new GradientDrawable();
-        ring.setCornerRadius(px(14));
-        ring.setColor(0x22FFFFFF);
-        ring.setStroke(px(4), Color.WHITE);
-        return ring;
     }
 
     private int px(int dp) {
@@ -238,10 +433,10 @@ public class MainActivity extends Activity {
             Tile tile = tiles.get(position);
             FrameLayout box = new FrameLayout(MainActivity.this);
             box.setLayoutParams(new GridView.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, px(150)));
-            GradientDrawable bg = new GradientDrawable();
-            bg.setCornerRadius(px(14));
-            bg.setColor(COLORS[position % COLORS.length]);
+                    ViewGroup.LayoutParams.MATCH_PARENT, px(128)));
+            GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                    new int[] {tile.color, shade(tile.color)});
+            bg.setCornerRadius(px(16));
             box.setBackground(bg);
 
             LinearLayout column = new LinearLayout(MainActivity.this);
@@ -250,16 +445,23 @@ public class MainActivity extends Activity {
             if (tile.icon != null) {
                 ImageView icon = new ImageView(MainActivity.this);
                 icon.setImageDrawable(tile.icon);
-                column.addView(icon, new LinearLayout.LayoutParams(px(72), px(72)));
+                column.addView(icon, new LinearLayout.LayoutParams(px(60), px(60)));
             }
-            TextView label = text(19, Color.WHITE);
+            TextView label = text(tile.icon == null ? 26 : 17, Color.WHITE);
             label.setGravity(Gravity.CENTER);
             label.setText(tile.label);
-            label.setPadding(px(8), px(8), px(8), 0);
+            if (tile.icon == null) {
+                label.setTypeface(Typeface.DEFAULT_BOLD);
+            }
+            label.setPadding(px(8), px(4), px(8), 0);
             column.addView(label);
             box.addView(column, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
             return box;
+        }
+
+        private int shade(int color) {
+            return Color.rgb(Color.red(color) / 2, Color.green(color) / 2, Color.blue(color) / 2);
         }
     }
 }

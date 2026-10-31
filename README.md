@@ -1,13 +1,16 @@
 # KitKat TV Home
 
-A small, offline Home screen for old MStar Android 4.4 smart TVs: a clock and one grid of large tiles,
-with TV inputs and YouTube (through [SmartTube](https://github.com/yuliskov/SmartTube)) first.
+A small, offline Home screen for old MStar Android 4.4 smart TVs: colourful tiles with a glow that follows
+the selected tile, with YouTube (through [SmartTube](https://github.com/yuliskov/SmartTube)) first.
 Modern launchers need Android 8 or newer; this one runs on Android 4.4.
 
-![The home screen: a clock above tiles for TV Inputs, YouTube, Media Center, Play Store and Settings](docs/home.png)
+![The home screen: a greeting and clock above brand-coloured tiles, with Media Center selected](docs/home.png)
 
-- About 16 KB, about 25 MB of RAM in use on a TV with 372 MB
+- About 20 KB, about 25 MB of RAM in use on a TV with 372 MB
 - No network permission, no background services, no dependencies
+- An idle clock after 3 minutes, which moves every minute to protect the panel
+- Netflix, Spotify, Shahid and WATCH IT tiles for a streaming stick on HDMI: these apps do not run on
+  Android 4.4, so the tiles explain that and offer the TV's input menu
 - Factory and test apps are hidden on purpose: opening them can change a TV's factory state
 - The stock launcher stays installed as a fallback
 
